@@ -111,6 +111,7 @@ tracked there:
 - [Issue #1: Qwen3.8-27B 8-bit support](https://github.com/yenhao-huang/FlexLLMGen/issues/1)
 - [Issue #2: reproducible tensor-placement search](https://github.com/yenhao-huang/FlexLLMGen/issues/2)
 - [Issue #3: GPT-5.6 Sol placement workflow](https://github.com/yenhao-huang/FlexLLMGen/issues/3)
+- [Pull request #4: implementation and results](https://github.com/yenhao-huang/FlexLLMGen/pull/4)
 
 ## Validation and limitations
 
