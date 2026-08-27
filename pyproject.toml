@@ -17,6 +17,22 @@ dependencies = [
     "numpy", "tqdm", "pulp", "attrs",
 ]
 
+[project.optional-dependencies]
+qwen = [
+    "torch>=2.9; python_version >= '3.10'",
+    "transformers>=5.8.0; python_version >= '3.10'",
+    "accelerate>=1.12; python_version >= '3.10'",
+    "bitsandbytes>=0.49; python_version >= '3.10'",
+    "torchao>=0.15; python_version >= '3.10'",
+    "safetensors>=0.6; python_version >= '3.10'",
+]
+sol = [
+    "openai>=1.66; python_version >= '3.10'",
+]
+
+[project.scripts]
+flexllmgen-hf = "flexllmgen.hf_opt:main"
+
 [project.urls]
 "Homepage" = "https://github.com/FMInference/FlexLLMGen"
 "Bug Tracker" = "https://github.com/FMInference/FlexLLMGen/issues"
@@ -26,5 +42,3 @@ exclude = ["benchmark*", "dist*", "playground*", "scripts*"]
 
 [tool.wheel]
 exclude = ["benchmark*", "dist*", "playground*", "scripts*"]
-
-
