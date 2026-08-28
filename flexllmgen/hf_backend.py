@@ -161,6 +161,8 @@ class HFBenchmarkResult:
     model_logical_bytes: int
     quantized_parameter_tensors: int
     gpu_peak_memory_bytes: Mapping[str, int]
+    generated_text: Optional[List[str]] = None
+    fine_grained_placement: Optional[Mapping[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return dataclasses.asdict(self)
@@ -182,8 +184,9 @@ def append_jsonl(path: str, record: Mapping[str, Any]) -> None:
 class HFOffloadLM:
     """Lazy Transformers model wrapper with explicit placement controls."""
 
-    def __init__(self, config: HFOffloadConfig):
+    def __init__(self, config: HFOffloadConfig, fine_grained_plan=None):
         self.config = config
+        self.fine_grained_plan = fine_grained_plan
         self.model = None
         self.tokenizer = None
         self._torch = None
@@ -227,10 +230,27 @@ class HFOffloadLM:
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
 
+        load_config = self.config
+        if self.fine_grained_plan is not None and self.config.quantization == "int8-torchao":
+            load_config = dataclasses.replace(
+                self.config,
+                device_map=self.fine_grained_plan.quantization_load_device_map,
+            )
         self.model = model_class.from_pretrained(
             self.config.model,
-            **self.config.model_kwargs(transformers)
+            **load_config.model_kwargs(transformers)
         ).eval()
+        if self.fine_grained_plan is not None:
+            from flexllmgen.qwen_flex import install_qwen_fine_grained_runtime
+
+            install_qwen_fine_grained_runtime(
+                self.model,
+                self.fine_grained_plan,
+                offload_dir=self.config.offload_dir,
+            )
+            # Report the requested homes, not the temporary CPU homes used
+            # while TorchAO materialized disk-bound stages.
+            self.model.hf_device_map = dict(self.fine_grained_plan.device_map)
         self._torch = torch
         return self
 
@@ -307,6 +327,11 @@ class HFOffloadLM:
 
         input_length = int(encoded["input_ids"].shape[1])
         generated = int(output_ids.numel() - encoded["input_ids"].numel())
+        generated_text = self.tokenizer.batch_decode(
+            output_ids[:, input_length:],
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )
         gpu_peaks = {}
         if torch.cuda.is_available():
             gpu_peaks = {
@@ -347,4 +372,9 @@ class HFOffloadLM:
             model_logical_bytes=int(footprint),
             quantized_parameter_tensors=quantized_tensors,
             gpu_peak_memory_bytes=gpu_peaks,
+            generated_text=generated_text,
+            fine_grained_placement=(
+                self.fine_grained_plan.summary()
+                if self.fine_grained_plan is not None else None
+            ),
         )

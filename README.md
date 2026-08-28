@@ -126,6 +126,22 @@ Use `--device-map cpu` for the comparable 8-bit DRAM-only baseline, or add
 reproducible placement search and result format are documented in
 [`exp/qwen3_8_27b`](exp/qwen3_8_27b/README.md).
 
+For sub-layer FlexLLMGen placement, add six original-style percentages. This
+splits Qwen RMSNorm, full-attention projections/score, DeltaNet stages, and FFN
+projections rather than assigning an entire decoder layer at once:
+
+```
+python3 -m flexllmgen.hf_opt \
+  --model /models/Qwen-Qwen3.8-27B --quantization int8-torchao \
+  --gpu-memory 1GiB 15GiB --cpu-memory 35GiB \
+  --flex-percent 49 51 100 0 100 0 --local-files-only
+```
+
+On the documented two-GPU host, a reproducible two-repeat search selected
+49/51 GPU/CPU weights while keeping cache and activations on the compute GPU.
+The measurements and exact selection rule are in
+[`exp/qwen3_8_27b/WEIGHT_SELECTION.md`](exp/qwen3_8_27b/WEIGHT_SELECTION.md).
+
 ### Run HELM Benchmark with FlexLLMGen
 FlexLLMGen can be integrated into [HELM](https://crfm.stanford.edu/helm), a language model benchmark framework, as its execution backend.
 You can use the commands below to run a Massive Multitask Language Understanding (MMLU) [scenario](https://crfm.stanford.edu/helm/latest/?group=mmlu) with a single T4 (16GB) GPU and 200GB of DRAM.

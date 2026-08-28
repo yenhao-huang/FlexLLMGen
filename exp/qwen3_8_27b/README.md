@@ -47,6 +47,78 @@ python exp/qwen3_8_27b/run_search.py \
   --local-files-only
 ```
 
+## Fine-grained FlexLLMGen placement
+
+Accelerate's named strategies keep a decoder block intact.  The Qwen-specific
+FlexLLMGen planner can instead place the parameter homes for each RMSNorm,
+Q/K/V/O projection, DeltaNet projection/convolution/norm, and FFN
+gate/up/down projection independently.  It also exposes the operations with no
+checkpoint tensor as explicit runtime stages: full-attention score/softmax,
+the linear-attention delta rule, and the hidden state at every decoder-block
+boundary.
+
+The six values passed to `--flex-percent` retain the original FlexLLMGen
+meaning:
+
+1. weight GPU and CPU percentages;
+2. KV/recurrent-state cache GPU and CPU percentages;
+3. activation GPU and CPU percentages.
+
+The remainder of each pair is disk. Disk weight stages are supported through
+per-stage streaming. Cache and activation disk homes are deliberately rejected
+instead of being mislabeled; their CPU/GPU percentages must sum to 100. CPU and
+disk weight homes are streamed to the primary compute GPU for their operation.
+The primary GPU defaults to the entry with the largest `--gpu-memory` budget.
+
+Inspect the complete stage graph without loading PyTorch or CUDA:
+
+```bash
+python -m flexllmgen.hf_opt \
+  --model /models/Qwen-Qwen3.8-27B \
+  --gpu-memory 1GiB 15GiB --cpu-memory 35GiB \
+  --flex-percent 49 51 100 0 100 0 \
+  --local-files-only --dry-run --print-flex-plan
+```
+
+Run the measured configuration:
+
+```bash
+python -m flexllmgen.hf_opt \
+  --model /models/Qwen-Qwen3.8-27B \
+  --quantization int8-torchao \
+  --gpu-memory 1GiB 15GiB --cpu-memory 35GiB \
+  --flex-percent 49 51 100 0 100 0 \
+  --offload-dir /data/flexllmgen-offload/qwen3.8-27b-fine \
+  --local-files-only --batch-size 1 --warmup-tokens 1 --gen-len 4 \
+  --output-jsonl exp/qwen3_8_27b/selected_weight_results.jsonl
+```
+
+Qwen3.8 is hybrid: 48 of its 64 text blocks use Gated DeltaNet linear
+attention, while every fourth block uses ordinary full attention. The planner
+uses the corresponding topology for each layer rather than applying a generic
+Q/K/V template to all 64 blocks.
+
+On this host, a two-repeat search selected **49/51 GPU/CPU weights**. It
+measured a median 0.152086 token/s, a worst observed 11.593 GiB peak PyTorch
+allocation on GPU 1, and 3.407 GiB of headroom from the configured 15 GiB
+budget. This was 10.40% faster than the 30/70 baseline. The adjacent 50/50
+candidate failed both repeats during Transformers' CUDA allocator warmup, so
+49/51 is the highest successful tested stage-map boundary. A mixed 75/25
+GPU/CPU cache and activation diagnostic was valid but substantially slower, so
+cache and activations remain 100% GPU in the recommended command.
+
+Run or resume the recorded weight search with:
+
+```bash
+python exp/qwen3_8_27b/run_flex_weight_search.py --resume
+```
+
+The complete selection table, fixed parameters, and reproduction command are
+in [`WEIGHT_SELECTION.md`](WEIGHT_SELECTION.md). Machine-readable selection,
+aggregate statistics, the environment manifest, and every success/OOM record
+are retained in `selected_weight_ratio.json`, `weight_search_aggregate.json`,
+`weight_search_manifest.json`, and `weight_search.jsonl`, respectively.
+
 For fair comparisons, keep `--prompt`, `--batch-size`, `--gen-len`, and
 `--warmup-tokens` identical. The search runner records load or OOM failures as
 rows instead of silently omitting them.
