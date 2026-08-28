@@ -14,6 +14,7 @@ from typing import Dict, Optional, Sequence, Union
 from flexllmgen.hf_backend import HFOffloadConfig, HFOffloadLM, append_jsonl
 from flexllmgen.qwen_flex import (
     FlexQwenPolicy,
+    build_agent_qwen_plan,
     build_qwen_plan,
 )
 
@@ -77,6 +78,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dtype", choices=("auto", "bfloat16", "float16", "float32"), default="auto")
     parser.add_argument("--local-files-only", action="store_true")
     parser.add_argument("--no-cpu-offload", action="store_true")
+    parser.add_argument(
+        "--fast-cpu-offload",
+        action="store_true",
+        help=(
+            "Reuse CUDA allocator blocks between Accelerate CPU-offloaded stages "
+            "instead of clearing the cache after every tensor materialization."
+        ),
+    )
     parser.add_argument("--prompt", default="Explain tensor offloading in one sentence.")
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--gen-len", type=int, default=16)
@@ -103,6 +112,14 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Include every fine-grained Qwen stage in dry-run output.",
     )
+    parser.add_argument(
+        "--agent-placement",
+        action="store_true",
+        help=(
+            "Use the experimental text-only heterogeneous Qwen plan: persistent "
+            "GPU attention/lm-head, CPU FBGEMM FFNs, and sparse CPU embedding gather."
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true")
     return parser
 
@@ -113,6 +130,17 @@ def main(argv=None) -> int:
         raise SystemExit("--batch-size must be positive")
     plan = None
     requested_device_map = args.device_map
+    if args.agent_placement and args.flex_percent is not None:
+        raise SystemExit("--agent-placement and --flex-percent are mutually exclusive")
+    if args.agent_placement:
+        try:
+            plan = build_agent_qwen_plan(
+                args.model,
+                _compute_device(args.gpu_memory, args.flex_compute_device),
+            )
+        except (ValueError, OSError) as exc:
+            raise SystemExit(str(exc)) from exc
+        requested_device_map = plan.device_map
     if args.flex_percent is not None:
         try:
             policy = FlexQwenPolicy.from_sequence(args.flex_percent)
@@ -134,6 +162,7 @@ def main(argv=None) -> int:
         dtype=args.dtype,
         local_files_only=args.local_files_only,
         cpu_offload=not args.no_cpu_offload,
+        fast_cpu_offload=args.fast_cpu_offload,
     )
     if args.dry_run:
         output = config.to_dict()

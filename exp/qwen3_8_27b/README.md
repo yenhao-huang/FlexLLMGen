@@ -119,6 +119,34 @@ aggregate statistics, the environment manifest, and every success/OOM record
 are retained in `selected_weight_ratio.json`, `weight_search_aggregate.json`,
 `weight_search_manifest.json`, and `weight_search.jsonl`, respectively.
 
+## Heterogeneous agent placement
+
+The 49/51 path executes all projections on GPU and streams CPU-owned weights.
+Physical GPU 1 is connected through PCIe Gen3 x4, so that transfer model limits
+batch-1 decode. The experimental `--agent-placement` mode instead keeps all
+attention/DeltaNet/norm/lm-head tensors on GPU, packs all complete FFNs for CPU
+FBGEMM execution, gathers embedding rows on CPU, and leaves the unused vision
+tower off GPU.
+
+```bash
+CUDA_VISIBLE_DEVICES=1 python -m flexllmgen.hf_opt \
+  --model /models/Qwen-Qwen3.8-27B \
+  --quantization int8-torchao \
+  --gpu-memory 15GiB --cpu-memory 35GiB \
+  --agent-placement --flex-compute-device 0 --fast-cpu-offload \
+  --offload-dir /data/flexllmgen-offload/agent-placement-2 \
+  --local-files-only --batch-size 1 \
+  --prompt 'Explain tensor offloading in one sentence.' \
+  --warmup-tokens 1 --gen-len 4 \
+  --output-jsonl exp/agent_placement/2/results.jsonl
+```
+
+Two independent processes measured 2.215825 and 2.509718 token/s, with a
+2.362771 token/s median and identical 9.412 GiB GPU peak. CPU FFNs use dynamic
+activation int8 plus per-channel int8 weights, so validate task quality before
+production use. Full plan/dev/test/reflection records are in
+[`exp/agent_placement`](../agent_placement/README.md).
+
 For fair comparisons, keep `--prompt`, `--batch-size`, `--gen-len`, and
 `--warmup-tokens` identical. The search runner records load or OOM failures as
 rows instead of silently omitting them.

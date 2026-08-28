@@ -12,6 +12,7 @@ this module without importing PyTorch.
 """
 
 import dataclasses
+import functools
 import json
 import os
 import time
@@ -53,6 +54,7 @@ class HFOffloadConfig:
     dtype: str = "auto"
     local_files_only: bool = False
     cpu_offload: bool = True
+    fast_cpu_offload: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.model, str) or not self.model.strip():
@@ -161,6 +163,7 @@ class HFBenchmarkResult:
     model_logical_bytes: int
     quantized_parameter_tensors: int
     gpu_peak_memory_bytes: Mapping[str, int]
+    fast_cpu_offload: bool = False
     generated_text: Optional[List[str]] = None
     fine_grained_placement: Optional[Mapping[str, Any]] = None
 
@@ -179,6 +182,35 @@ def append_jsonl(path: str, record: Mapping[str, Any]) -> None:
         os.makedirs(parent, exist_ok=True)
     with open(expanded, "a", encoding="utf-8") as output:
         output.write(json.dumps(dict(record), sort_keys=True) + "\n")
+
+
+def _install_accelerate_fast_cpu_offload() -> bool:
+    """Keep CUDA allocator blocks reusable during Accelerate CPU offload.
+
+    Accelerate's offload hook materializes every direct module tensor through
+    ``set_module_tensor_to_device``. Its default clears the CUDA allocator
+    cache after each tensor, which serializes hundreds of fine-grained Qwen
+    stages. Inference already releases each temporary tensor by replacing it
+    with a meta tensor after the forward call, so cached allocator blocks can
+    be safely reused by the next stage.
+
+    The patch is process-local and idempotent. Experiment runs use a fresh
+    process, so the legacy and fast paths remain independently measurable.
+    """
+    import accelerate.hooks as accelerate_hooks
+
+    current = accelerate_hooks.set_module_tensor_to_device
+    if getattr(current, "_flexllmgen_no_per_tensor_cache_clear", False):
+        return False
+
+    @functools.wraps(current)
+    def without_per_tensor_cache_clear(*args, **kwargs):
+        kwargs.setdefault("clear_cache", False)
+        return current(*args, **kwargs)
+
+    without_per_tensor_cache_clear._flexllmgen_no_per_tensor_cache_clear = True
+    accelerate_hooks.set_module_tensor_to_device = without_per_tensor_cache_clear
+    return True
 
 
 class HFOffloadLM:
@@ -251,6 +283,8 @@ class HFOffloadLM:
             # Report the requested homes, not the temporary CPU homes used
             # while TorchAO materialized disk-bound stages.
             self.model.hf_device_map = dict(self.fine_grained_plan.device_map)
+        if self.config.fast_cpu_offload:
+            _install_accelerate_fast_cpu_offload()
         self._torch = torch
         return self
 
@@ -372,6 +406,7 @@ class HFOffloadLM:
             model_logical_bytes=int(footprint),
             quantized_parameter_tensors=quantized_tensors,
             gpu_peak_memory_bytes=gpu_peaks,
+            fast_cpu_offload=self.config.fast_cpu_offload,
             generated_text=generated_text,
             fine_grained_placement=(
                 self.fine_grained_plan.summary()

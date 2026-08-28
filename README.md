@@ -142,6 +142,24 @@ On the documented two-GPU host, a reproducible two-repeat search selected
 The measurements and exact selection rule are in
 [`exp/qwen3_8_27b/WEIGHT_SELECTION.md`](exp/qwen3_8_27b/WEIGHT_SELECTION.md).
 
+For text-only batch-1 decode on a narrow PCIe link, the experimental agent
+placement keeps attention and the LM head on GPU while executing complete FFNs
+with CPU FBGEMM. On the documented physical GPU 1 it measured a two-run median
+of 2.362771 token/s:
+
+```
+CUDA_VISIBLE_DEVICES=1 python3 -m flexllmgen.hf_opt \
+  --model /models/Qwen-Qwen3.8-27B --quantization int8-torchao \
+  --gpu-memory 15GiB --cpu-memory 35GiB \
+  --agent-placement --flex-compute-device 0 --fast-cpu-offload \
+  --local-files-only --batch-size 1 --warmup-tokens 1 --gen-len 4
+```
+
+This path dynamically quantizes CPU activations in addition to using int8
+weights, so it is not numerically identical to the weight-only baseline. The
+iteration records and trade-offs are documented in
+[`exp/agent_placement`](exp/agent_placement/README.md).
+
 ### Run HELM Benchmark with FlexLLMGen
 FlexLLMGen can be integrated into [HELM](https://crfm.stanford.edu/helm), a language model benchmark framework, as its execution backend.
 You can use the commands below to run a Massive Multitask Language Understanding (MMLU) [scenario](https://crfm.stanford.edu/helm/latest/?group=mmlu) with a single T4 (16GB) GPU and 200GB of DRAM.

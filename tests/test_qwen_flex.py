@@ -6,6 +6,7 @@ import pytest
 from flexllmgen.hf_opt import main
 from flexllmgen.qwen_flex import (
     FlexQwenPolicy,
+    build_agent_qwen_plan,
     build_qwen_plan,
 )
 
@@ -117,3 +118,44 @@ def test_flex_dry_run_selects_largest_gpu_budget(tmp_path, capsys):
     output = json.loads(capsys.readouterr().out)
     assert output["flex_plan"]["compute_device"] == 1
     assert output["flex_plan"]["stages"]["count"] > 20
+
+
+def test_agent_plan_co_locates_ffn_on_cpu_and_attention_on_gpu(tmp_path):
+    _write_checkpoint(tmp_path)
+    plan = build_agent_qwen_plan(str(tmp_path), 1)
+    by_category = {(stage.layer, stage.category): stage for stage in plan.stages}
+
+    assert plan.strategy == "agent_cpu_ffn_v1"
+    assert by_category[(0, "mlp.gate_proj")].home == "cpu"
+    assert by_category[(0, "mlp.up_proj")].home == "cpu"
+    assert by_category[(0, "mlp.down_proj")].home == "cpu"
+    assert by_category[(0, "full_attention.q_proj")].home == 1
+    assert by_category[(1, "linear_attention.in_proj_qkv")].home == 1
+    assert by_category[(0, "input_layernorm")].home == 1
+    assert by_category[(0, "full_attention.score")].execution_device == 1
+
+
+def test_agent_dry_run_records_strategy(tmp_path, capsys):
+    _write_checkpoint(tmp_path)
+    assert main([
+        "--model", str(tmp_path),
+        "--gpu-memory", "15GiB",
+        "--cpu-memory", "35GiB",
+        "--agent-placement",
+        "--dry-run",
+    ]) == 0
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["flex_plan"]["strategy"] == "agent_cpu_ffn_v1"
+    assert output["flex_plan"]["compute_device"] == 0
+
+
+def test_agent_and_flex_percent_are_mutually_exclusive(tmp_path):
+    _write_checkpoint(tmp_path)
+    with pytest.raises(SystemExit, match="mutually exclusive"):
+        main([
+            "--model", str(tmp_path),
+            "--agent-placement",
+            "--flex-percent", "49", "51", "100", "0", "100", "0",
+            "--dry-run",
+        ])

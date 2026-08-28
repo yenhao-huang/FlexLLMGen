@@ -7,6 +7,30 @@ pytestmark = pytest.mark.skipif(
     reason="fine-grained Qwen runtime integration needs CUDA device 1",
 )
 
+
+def test_agent_fbgemm_conversion_matches_torchao_projection():
+    pytest.importorskip("torchao")
+    from torchao.quantization import Int8WeightOnlyConfig, quantize_
+
+    from flexllmgen.qwen_flex import _aqt_to_fbgemm_dynamic_linear
+
+    torch.manual_seed(0)
+    reference = torch.nn.Linear(32, 64, bias=False).eval()
+    quantize_(
+        reference,
+        Int8WeightOnlyConfig(group_size=None, version=1),
+    )
+    converted = _aqt_to_fbgemm_dynamic_linear(reference)
+    inputs = torch.randn(3, 32)
+
+    with torch.inference_mode():
+        expected = reference(inputs)
+        actual = converted(inputs)
+
+    assert type(converted).__module__.startswith("torch.ao.nn.quantized.dynamic")
+    torch.testing.assert_close(actual, expected, atol=0.08, rtol=0.08)
+
+
 def test_tiny_qwen_mixes_disk_weights_cpu_cores_and_cpu_activations(tmp_path):
     pytest.importorskip("torchao")
     from torchao.quantization import Int8WeightOnlyConfig

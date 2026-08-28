@@ -4,7 +4,7 @@ import types
 
 import pytest
 
-from flexllmgen.hf_backend import HFOffloadConfig
+from flexllmgen.hf_backend import HFOffloadConfig, _install_accelerate_fast_cpu_offload
 from flexllmgen.hf_opt import main
 from flexllmgen.placement import GIB, PlacementCandidate, generate_candidates
 
@@ -143,3 +143,36 @@ def test_dry_run_prints_stable_json(capsys):
     output = json.loads(capsys.readouterr().out)
     assert output["model"] == "Qwen/Qwen3.8-27B"
     assert output["max_memory"] == {"0": "20GiB", "1": "20GiB", "cpu": "32GiB"}
+
+
+def test_fast_cpu_offload_is_exposed_in_dry_run(capsys):
+    assert main([
+        "--model", "Qwen/Qwen3.8-27B",
+        "--device-map", "balanced",
+        "--fast-cpu-offload",
+        "--dry-run",
+    ]) == 0
+
+    output = json.loads(capsys.readouterr().out)
+    assert output["fast_cpu_offload"] is True
+
+
+def test_fast_cpu_offload_disables_default_cache_clear(monkeypatch):
+    import accelerate.hooks as accelerate_hooks
+
+    calls = []
+
+    def fake_set_module_tensor_to_device(*args, **kwargs):
+        calls.append((args, kwargs))
+
+    monkeypatch.setattr(
+        accelerate_hooks,
+        "set_module_tensor_to_device",
+        fake_set_module_tensor_to_device,
+    )
+
+    assert _install_accelerate_fast_cpu_offload() is True
+    assert _install_accelerate_fast_cpu_offload() is False
+    accelerate_hooks.set_module_tensor_to_device("module", "weight", "cuda:0")
+
+    assert calls[0][1]["clear_cache"] is False

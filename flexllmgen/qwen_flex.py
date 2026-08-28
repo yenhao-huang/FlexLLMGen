@@ -423,6 +423,66 @@ def build_qwen_plan(
     )
 
 
+def build_agent_qwen_plan(
+    model_path: str,
+    compute_device: Device,
+) -> QwenFineGrainedPlan:
+    """Build the text-only heterogeneous placement used by agent iteration 2.
+
+    Decoder FFNs are kept together on CPU for FBGEMM execution. Attention,
+    recurrent state, normalization, and the LM head remain resident on the
+    compute GPU. The embedding is CPU-resident but replaced with sparse row
+    gather at runtime, and the unused vision tower remains off GPU.
+    """
+    base = build_qwen_plan(
+        model_path,
+        FlexQwenPolicy.from_sequence([0, 100, 100, 0, 100, 0]),
+        compute_device,
+    )
+    stages = []
+    for stage in base.stages:
+        if stage.synthetic:
+            home = compute_device
+            execution_device = compute_device
+        elif (
+            stage.category.startswith("mlp.")
+            or stage.category in {"embedding", "vision"}
+        ):
+            home = "cpu"
+            execution_device = "cpu" if stage.category.startswith("mlp.") else compute_device
+        else:
+            home = compute_device
+            execution_device = compute_device
+        stages.append(dataclasses.replace(
+            stage,
+            home=home,
+            execution_device=execution_device,
+        ))
+
+    total = sum(stage.checkpoint_bytes for stage in stages if not stage.synthetic)
+    gpu = sum(
+        stage.checkpoint_bytes
+        for stage in stages
+        if not stage.synthetic and stage.home == compute_device
+    )
+    actual_gpu_percent = 100.0 * gpu / max(total, 1)
+    policy = FlexQwenPolicy.from_sequence([
+        actual_gpu_percent,
+        100.0 - actual_gpu_percent,
+        100,
+        0,
+        100,
+        0,
+    ])
+    return QwenFineGrainedPlan(
+        model=base.model,
+        policy=policy,
+        compute_device=compute_device,
+        stages=tuple(stages),
+        strategy="agent_cpu_ffn_v1",
+    )
+
+
 def _move_tensors(value, device):
     """Move tensors nested in the small argument structures used by Qwen."""
     try:
@@ -596,6 +656,179 @@ def _install_disk_stage(module, path: str, execution_device) -> None:
     add_hook_to_module(module, DiskStageHook())
 
 
+def _accelerate_offload_value(module, name: str):
+    """Return a direct tensor from an Accelerate offload hook or the module."""
+    hook = getattr(module, "_hf_hook", None)
+    hooks = getattr(hook, "hooks", (hook,))
+    for candidate in hooks:
+        weights_map = getattr(candidate, "weights_map", None)
+        if weights_map is None:
+            continue
+        try:
+            return weights_map[name]
+        except (KeyError, TypeError):
+            pass
+    value = getattr(module, name, None)
+    if value is None or str(value.device) == "meta":
+        raise RuntimeError(
+            "agent placement cannot recover {}.{} from its offload hook".format(
+                type(module).__name__, name
+            )
+        )
+    return value.detach().cpu()
+
+
+def _aqt_to_fbgemm_dynamic_linear(module):
+    """Pack one TorchAO per-row affine-int8 Linear for CPU FBGEMM."""
+    import torch
+
+    weight = _accelerate_offload_value(module, "weight")
+    tensor_impl = getattr(weight, "tensor_impl", None)
+    if tensor_impl is None or not hasattr(tensor_impl, "int_data"):
+        raise TypeError(
+            "agent CPU FFN requires a TorchAO affine quantized weight, got {}".format(
+                type(weight).__name__
+            )
+        )
+    int_data = tensor_impl.int_data.detach().cpu().contiguous()
+    scale = tensor_impl.scale.detach().cpu().reshape(-1).float()
+    zero_point = tensor_impl.zero_point
+    if zero_point is None:
+        zero_point = torch.zeros_like(scale, dtype=torch.long)
+    else:
+        zero_point = zero_point.detach().cpu().reshape(-1).long()
+    if scale.numel() != int_data.shape[0] or zero_point.numel() != int_data.shape[0]:
+        raise ValueError(
+            "agent CPU FFN supports per-output-channel TorchAO weights only"
+        )
+    quantized_weight = torch._make_per_channel_quantized_tensor(
+        int_data,
+        scale,
+        zero_point,
+        0,
+    )
+    bias = None
+    if getattr(module, "bias", None) is not None:
+        bias = _accelerate_offload_value(module, "bias").detach().cpu().float()
+    packed = torch.ao.nn.quantized.dynamic.Linear(
+        module.in_features,
+        module.out_features,
+        bias_=bias is not None,
+        dtype=torch.qint8,
+    )
+    packed.set_weight_bias(quantized_weight, bias)
+    return packed.eval()
+
+
+def _install_agent_cpu_ffn_runtime(model, plan, modules) -> None:
+    """Replace CPU-owned FFNs and embedding with activation-transfer modules."""
+    import gc
+    import torch
+
+    compute_device = (
+        "cuda:{}".format(plan.compute_device)
+        if isinstance(plan.compute_device, int)
+        else plan.compute_device
+    )
+
+    class AgentCPUMLP(torch.nn.Module):
+        def __init__(self, original):
+            super().__init__()
+            self.gate_proj = _aqt_to_fbgemm_dynamic_linear(original.gate_proj)
+            self.up_proj = _aqt_to_fbgemm_dynamic_linear(original.up_proj)
+            self.down_proj = _aqt_to_fbgemm_dynamic_linear(original.down_proj)
+            self.act_fn = original.act_fn
+            self.hidden_size = original.hidden_size
+            self.intermediate_size = original.intermediate_size
+            self._agent_execution = "cpu_fbgemm_dynamic_int8"
+
+        def forward(self, hidden_states):
+            destination = hidden_states.device
+            output_dtype = hidden_states.dtype
+            cpu_hidden = hidden_states.to(device="cpu", dtype=torch.float32)
+            output = self.down_proj(
+                self.act_fn(self.gate_proj(cpu_hidden)) * self.up_proj(cpu_hidden)
+            )
+            return output.to(device=destination, dtype=output_dtype)
+
+    class AgentQuantizedEmbedding(torch.nn.Module):
+        def __init__(self, original):
+            super().__init__()
+            weight = _accelerate_offload_value(original, "weight")
+            tensor_impl = getattr(weight, "tensor_impl", None)
+            if tensor_impl is not None and hasattr(tensor_impl, "int_data"):
+                self.register_buffer("dense_weight", None)
+                self.register_buffer("int_data", tensor_impl.int_data.detach().cpu())
+                self.register_buffer(
+                    "scale",
+                    tensor_impl.scale.detach().cpu().reshape(self.int_data.shape[0], -1),
+                )
+                zero_point = tensor_impl.zero_point
+                if zero_point is None:
+                    zero_point = torch.zeros(
+                        (self.int_data.shape[0], 1), dtype=torch.float32
+                    )
+                else:
+                    zero_point = zero_point.detach().cpu().reshape(self.int_data.shape[0], -1)
+                self.register_buffer("zero_point", zero_point)
+                execution = "cpu_quantized_row_gather"
+            else:
+                # TorchAO quantizes Linear modules, not nn.Embedding. Keep the
+                # original BF16 table in DRAM and gather only referenced rows.
+                self.register_buffer("dense_weight", weight.detach().cpu())
+                self.register_buffer("int_data", None)
+                self.register_buffer("scale", None)
+                self.register_buffer("zero_point", None)
+                execution = "cpu_dense_row_gather"
+            self.num_embeddings = original.num_embeddings
+            self.embedding_dim = original.embedding_dim
+            self.padding_idx = original.padding_idx
+            self.output_dtype = weight.dtype
+            self.execution_device = compute_device
+            self._agent_execution = execution
+
+        def forward(self, input_ids):
+            shape = tuple(input_ids.shape) + (self.embedding_dim,)
+            indices = input_ids.detach().to(device="cpu", dtype=torch.long).reshape(-1)
+            if self.dense_weight is not None:
+                rows = self.dense_weight.index_select(0, indices)
+            else:
+                rows = self.int_data.index_select(0, indices).float()
+                scales = self.scale.index_select(0, indices)
+                zero_points = self.zero_point.index_select(0, indices).float()
+                rows = (rows - zero_points) * scales
+            return rows.reshape(shape).to(
+                device=self.execution_device,
+                dtype=self.output_dtype,
+            )
+
+    prefix = "model.language_model.layers."
+    layer_count = len(model.model.language_model.layers)
+    for layer_index in range(layer_count):
+        layer = modules[prefix + str(layer_index)]
+        original = layer.mlp
+        layer.mlp = AgentCPUMLP(original)
+        for suffix in (".mlp.gate_proj", ".mlp.up_proj", ".mlp.down_proj", ".mlp"):
+            modules.pop(prefix + str(layer_index) + suffix, None)
+        del original
+
+    embedding_name = "model.language_model.embed_tokens"
+    original_embedding = modules[embedding_name]
+    model.model.language_model.embed_tokens = AgentQuantizedEmbedding(original_embedding)
+    modules.pop(embedding_name, None)
+    del original_embedding
+
+    model._agent_execution = {
+        "strategy": plan.strategy,
+        "cpu_ffn_layers": layer_count,
+        "cpu_ffn_kernel": "fbgemm_dynamic_activation_int8_weight",
+        "embedding": model.model.language_model.embed_tokens._agent_execution,
+    }
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def install_qwen_fine_grained_runtime(
     model,
     plan: QwenFineGrainedPlan,
@@ -674,3 +907,6 @@ def install_qwen_fine_grained_runtime(
             return _move_tensors(__forward(*args, **kwargs), __device)
 
         target.forward = types.MethodType(layer_forward, target)
+
+    if plan.strategy == "agent_cpu_ffn_v1":
+        _install_agent_cpu_ffn_runtime(model, plan, modules)
