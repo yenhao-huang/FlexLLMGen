@@ -70,6 +70,13 @@ cd FlexLLMGen
 pip install -e .
 ```
 
+For Qwen3.8 and other modern Hugging Face architectures, install the optional
+backend dependencies with Python 3.10 or newer:
+
+```
+pip install -e '.[qwen]'
+```
+
 ## Usage and Examples
 
 ### Get Started with a Single GPU
@@ -97,6 +104,61 @@ You can then try to offloading all weights to disk by
 ```
 python3 -m flexllmgen.flex_opt --model facebook/opt-175b --percent 0 0 100 0 100 0 --offload-dir YOUR_SSD_FOLDER
 ```
+
+#### Qwen3.8-27B (8-bit)
+
+Qwen3.8 uses a hybrid linear/full-attention architecture, so it runs through
+the additive Hugging Face backend rather than the legacy OPT-only kernels.
+The following command loads an already downloaded checkpoint in 8-bit and
+lets Accelerate balance tensors across two GPUs and CPU memory:
+
+```
+python3 -m flexllmgen.hf_opt \
+  --model /models/Qwen-Qwen3.8-27B \
+  --quantization int8-torchao --device-map balanced \
+  --gpu-memory 20GiB 20GiB --cpu-memory 32GiB \
+  --offload-dir /data/flexllmgen-offload/qwen3.8-27b \
+  --local-files-only
+```
+
+Use `--device-map cpu` for the comparable 8-bit DRAM-only baseline, or add
+`--quantization none --dtype bfloat16` for an unquantized CPU reference. A
+reproducible placement search and result format are documented in
+[`exp/qwen3_8_27b`](exp/qwen3_8_27b/README.md).
+
+For sub-layer FlexLLMGen placement, add six original-style percentages. This
+splits Qwen RMSNorm, full-attention projections/score, DeltaNet stages, and FFN
+projections rather than assigning an entire decoder layer at once:
+
+```
+python3 -m flexllmgen.hf_opt \
+  --model /models/Qwen-Qwen3.8-27B --quantization int8-torchao \
+  --gpu-memory 1GiB 15GiB --cpu-memory 35GiB \
+  --flex-percent 49 51 100 0 100 0 --local-files-only
+```
+
+On the documented two-GPU host, a reproducible two-repeat search selected
+49/51 GPU/CPU weights while keeping cache and activations on the compute GPU.
+The measurements and exact selection rule are in
+[`exp/qwen3_8_27b/WEIGHT_SELECTION.md`](exp/qwen3_8_27b/WEIGHT_SELECTION.md).
+
+For text-only batch-1 decode on a narrow PCIe link, the experimental agent
+placement keeps attention and the LM head on GPU while executing complete FFNs
+with CPU FBGEMM. On the documented physical GPU 1 it measured a two-run median
+of 2.362771 token/s:
+
+```
+CUDA_VISIBLE_DEVICES=1 python3 -m flexllmgen.hf_opt \
+  --model /models/Qwen-Qwen3.8-27B --quantization int8-torchao \
+  --gpu-memory 15GiB --cpu-memory 35GiB \
+  --agent-placement --flex-compute-device 0 --fast-cpu-offload \
+  --local-files-only --batch-size 1 --warmup-tokens 1 --gen-len 4
+```
+
+This path dynamically quantizes CPU activations in addition to using int8
+weights, so it is not numerically identical to the weight-only baseline. The
+iteration records and trade-offs are documented in
+[`exp/agent_placement`](exp/agent_placement/README.md).
 
 ### Run HELM Benchmark with FlexLLMGen
 FlexLLMGen can be integrated into [HELM](https://crfm.stanford.edu/helm), a language model benchmark framework, as its execution backend.

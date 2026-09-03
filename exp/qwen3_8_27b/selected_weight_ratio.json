@@ -1,0 +1,56 @@
+{
+  "fixed_benchmark_parameters": {
+    "activation_cpu_percent": 0,
+    "activation_gpu_percent": 100,
+    "batch_size": 1,
+    "cache_cpu_percent": 0,
+    "cache_gpu_percent": 100,
+    "compute_device": 1,
+    "cpu_memory": "35GiB",
+    "gen_len": 4,
+    "gpu_memory": [
+      "1GiB",
+      "15GiB"
+    ],
+    "local_files_only": true,
+    "prompt": "Explain tensor offloading in one sentence.",
+    "quantization": "int8-torchao",
+    "warmup_tokens": 1
+  },
+  "selected": {
+    "eligible": true,
+    "failure_reasons": {},
+    "failures": 0,
+    "headroom_from_budget_gib": 3.407139778137207,
+    "max_gpu_peak_memory_bytes": 12447738880,
+    "max_gpu_peak_memory_gib": 11.592860221862793,
+    "max_tokens_per_second": 0.15208802977943606,
+    "median_elapsed_seconds": 26.300845901481807,
+    "median_tokens_per_second": 0.15208636313309593,
+    "min_tokens_per_second": 0.15208469648675577,
+    "required_repeats": 2,
+    "stable": true,
+    "successes": 2,
+    "weight_cpu_percent": 51,
+    "weight_gpu_percent": 49
+  },
+  "selected_flex_percent": [
+    49,
+    51,
+    100,
+    0,
+    100,
+    0
+  ],
+  "selection_criteria": {
+    "gpu_budget_gib": 15.0,
+    "primary_metric": "median_tokens_per_second",
+    "required_headroom_gib": 1.0,
+    "requires_all_repeats_successful": true,
+    "tie_breakers": [
+      "lower_max_gpu_peak_memory_bytes",
+      "lower_weight_gpu_percent"
+    ]
+  },
+  "source_results": "/data/FlexLLMGen/exp/qwen3_8_27b/weight_search.jsonl"
+}

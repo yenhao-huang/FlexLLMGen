@@ -33,3 +33,7 @@ flexllmgen/apps/data_wrangle/core
 
 # tmp scripts
 today_job.sh
+
+# Local virtual environments and model offload artifacts
+.venv/
+offload/
